@@ -1,17 +1,40 @@
 export default async function handler(req, res) {
   // Allow requests from anywhere (CORS)
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Type', 'application/json');
 
-  // 1. Get the 'url' parameter from query string
-  const targetUrl = req.query.url;
+  let targetUrl = req.query.url;
+  const songId = req.query.id;
 
+  // 1. If an ID is provided instead of a URL, fetch the hlsUrl automatically
+  if (!targetUrl && songId) {
+    try {
+      const streamRes = await fetch(`https://gaanaayush.vercel.app/api/stream/${songId}`);
+      if (!streamRes.ok) {
+        return res.status(streamRes.status).json({
+          success: false,
+          error: `Failed to fetch stream data for ID ${songId}`
+        });
+      }
+      const streamJson = await streamRes.json();
+      targetUrl = streamJson?.data?.hlsUrl;
+    } catch (e) {
+      return res.status(500).json({ success: false, error: 'Failed to resolve ID to stream URL' });
+    }
+  }
+
+  // 2. Validate target URL
   if (!targetUrl) {
-    return res.status(400).send('Error: Missing "url" parameter.\nUsage: /api/token?url=https://example.com/playlist.m3u8');
+    return res.status(400).json({
+      success: false,
+      message: 'Missing "url" or "id" parameter.',
+      example_1: '/api/token?url=https://vodhlsgaana-ebw.akamaized.net/.../128.mp4.master.m3u8?...',
+      example_2: '/api/token?id=65632806'
+    });
   }
 
   try {
-    // 2. Fetch the M3U8 file
+    // 3. Fetch Master M3U8
     const response = await fetch(targetUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -19,66 +42,61 @@ export default async function handler(req, res) {
     });
 
     if (!response.ok) {
-      return res.status(response.status).send(`Failed to fetch M3U8. HTTP Status: ${response.status}`);
+      return res.status(response.status).json({
+        success: false,
+        error: `Failed to fetch M3U8. HTTP Status: ${response.status}`
+      });
     }
 
     const content = await response.text();
     const lines = content.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
 
-    const extractedUrls = [];
-    const uriRegex = /URI=["']([^"']+)["']/;
+    let subPlaylistUrl = '';
 
-    // Helper to convert relative URLs to full URLs
-    const resolve = (uri) => {
-      try {
-        const cleanUri = uri.replace(/^["']|["']$/g, '');
-        return new URL(cleanUri, targetUrl).href;
-      } catch (err) {
-        return uri;
-      }
-    };
-
-    // 3. Parse segments, variant streams, and keys
+    // 4. Extract variant sub-playlist (index.m3u8)
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-
-      // Segment URLs (#EXTINF)
-      if (line.startsWith('#EXTINF:')) {
+      if (lines[i].startsWith('#EXT-X-STREAM-INF:')) {
         let next = lines[++i];
         while (next && next.startsWith('#')) next = lines[++i];
-        if (next) extractedUrls.push(resolve(next));
-      }
-      // Master Variant Streams (#EXT-X-STREAM-INF)
-      else if (line.startsWith('#EXT-X-STREAM-INF:')) {
-        let next = lines[++i];
-        while (next && next.startsWith('#')) next = lines[++i];
-        if (next) extractedUrls.push(resolve(next));
-      }
-      // Init maps (#EXT-X-MAP)
-      else if (line.startsWith('#EXT-X-MAP:')) {
-        const match = line.match(uriRegex);
-        if (match) extractedUrls.push(resolve(match[1]));
-      }
-      // Encryption Keys (#EXT-X-KEY)
-      else if (line.startsWith('#EXT-X-KEY:')) {
-        const match = line.match(uriRegex);
-        if (match) extractedUrls.push(resolve(match[1]));
-      }
-      // Audio / Subtitles (#EXT-X-MEDIA)
-      else if (line.startsWith('#EXT-X-MEDIA:')) {
-        const match = line.match(uriRegex);
-        if (match) extractedUrls.push(resolve(match[1]));
+        if (next) {
+          subPlaylistUrl = new URL(next.replace(/^["']|["']$/g, ''), targetUrl).href;
+          break;
+        }
       }
     }
 
-    if (extractedUrls.length === 0) {
-      return res.status(200).send('No segment or stream URLs found in playlist.');
+    // Fallback if not an explicit STREAM-INF tag
+    if (!subPlaylistUrl) {
+      for (const line of lines) {
+        if (!line.startsWith('#') && line.includes('.m3u8')) {
+          subPlaylistUrl = new URL(line, targetUrl).href;
+          break;
+        }
+      }
     }
 
-    // 4. Return plain text lines
-    return res.status(200).send(extractedUrls.join('\n'));
+    if (!subPlaylistUrl) {
+      return res.status(404).json({
+        success: false,
+        error: 'No variant playlist or index.m3u8 URL found.'
+      });
+    }
+
+    // 5. Extract Token (hdntl=... or hdnts=...)
+    const tokenMatch = subPlaylistUrl.match(/(hdnt[a-z]=[^/&\s]+)/i);
+    const token = tokenMatch ? tokenMatch[1] : null;
+
+    // 6. Return JSON response
+    return res.status(200).json({
+      success: true,
+      token: token,
+      url: subPlaylistUrl
+    });
 
   } catch (error) {
-    return res.status(500).send(`Server Error: ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 }
